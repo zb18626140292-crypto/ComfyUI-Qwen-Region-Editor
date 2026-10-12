@@ -1,0 +1,3 @@
+# torch is managed by the ComfyUI environment.
+numpy
+Pillow
