@@ -249,7 +249,7 @@ function installAlignmentStatus(node) {
     if (node._qwenAlignmentStatus || typeof node.addDOMWidget !== "function") return;
     const status = document.createElement("div");
     status.style.cssText = "font:12px/1.5 sans-serif;white-space:normal;padding:5px 7px;color:#c7d5e2;background:#20252d;border-radius:4px;box-sizing:border-box;overflow:auto;max-height:85px";
-    status.textContent = "运行后显示对齐结果。x 正值向右，y 正值向下；低置信时保留原坐标。";
+    status.textContent = "运行后显示回贴、颜色校正和微羽化结果。微羽化只向选区内过渡，建议 1 像素。";
     node.addDOMWidget("qwen_alignment_status", "QwenAlignmentStatus", status, {
         serialize: false, hideOnZoom: false, getMinHeight: () => 58,
     });
@@ -266,14 +266,15 @@ function installAlignmentStatus(node) {
 function watchAlignmentParams(node) {
     const status = node._qwenAlignmentStatus;
     if (!status) return;
-    for (const name of ["alignment", "offset_x", "offset_y", "scale"]) {
+    const labels = {color_mode: "颜色校正", color_strength: "校正强度", edge_feather_pixels: "微羽化像素"};
+    for (const name of ["alignment", "offset_x", "offset_y", "scale", "color_mode", "color_strength", "edge_feather_pixels"]) {
         const field = widget(node, name);
+        if (field && labels[name]) field.label = labels[name];
         if (!field || field._qwenAlignmentCallback) continue;
         const oldCallback = field.callback;
         field.callback = function () {
             const result = oldCallback?.apply(this, arguments);
-            status.textContent = widget(node, "alignment")?.value === "关闭"
-                ? "对齐关闭，沿用原坐标回贴。" : "参数已改变，请重新运行查看对齐结果。";
+            status.textContent = "参数已改变，请重新运行查看回贴结果。";
             return result;
         };
         field._qwenAlignmentCallback = true;
@@ -299,6 +300,15 @@ function installInpaintStatus(node) {
 
 app.registerExtension({
     name: "Qwen.RegionEditor",
+    beforeConfigureGraph(data) {
+        for (const node of data?.nodes ?? []) {
+            if (node.type !== "QwenRegionComposite" || !Array.isArray(node.widgets_values)) continue;
+            const values = node.widgets_values;
+            if (values.length === 4 || (values.length === 5 && values[4] === "")) {
+                node.widgets_values = [...values.slice(0, 4), "关闭", 0.3, 0];
+            }
+        }
+    },
     nodeCreated(node) {
         const type = node.comfyClass ?? node.type;
         if (type === CLASS) install(node);

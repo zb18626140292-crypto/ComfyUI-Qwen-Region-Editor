@@ -173,6 +173,70 @@ def _aligned_patch(edit, local_box, matrix):
     return patch, valid[None, :, :, None].to(edit.dtype)
 
 
+def _skin_samples(rgb):
+    r, g, b = rgb.unbind(-1)
+    high, low = rgb.amax(-1), rgb.amin(-1)
+    saturation = (high-low) / high.clamp_min(1e-6)
+    light = 0.2126*r + 0.7152*g + 0.0722*b
+    return (torch.isfinite(rgb).all(-1) & (light > 0.14) & (light < 0.92)
+            & (r >= g-0.035) & (r >= b+0.008) & (g >= b-0.025)
+            & (high-low > 0.008) & (saturation < 0.58))
+
+
+def _correct_skin_color(source, edited, support, valid, local_box, strength, sample_mask=None):
+    h, w = source.shape[1:3]
+    stride = max(1, math.ceil(max(h, w) / 768))
+    original = source[:, ::stride, ::stride, :3].float()
+    generated = edited[:, ::stride, ::stride, :3].float()
+    differences = original-generated
+    eligible = (valid[:, ::stride, ::stride, 0] > 0)
+    eligible &= torch.isfinite(original).all(-1) & torch.isfinite(generated).all(-1)
+    eligible &= differences.abs().amax(-1) < 0.12
+    if sample_mask is not None:
+        selected = eligible & (sample_mask[:, ::stride, ::stride] > 0.5)
+        location = "指定蒙版"
+    else:
+        eligible &= _skin_samples(original) & _skin_samples(generated)
+        selected = eligible & support[:, ::stride, ::stride]
+        location = "框内肤色"
+        if int(torch.count_nonzero(selected)) < 64:
+            x0, y0, x1, y1 = local_box
+            ring = torch.zeros_like(support)
+            ring[:, max(0, y0-32):min(h, y1+32), max(0, x0-32):min(w, x1+32)] = True
+            selected = eligible & (ring & ~support)[:, ::stride, ::stride]
+            location = "周边保留区"
+    count = int(torch.count_nonzero(selected))
+    info = {"sample_area": location, "samples": count, "applied": False, "offset_rgb": [0.0, 0.0, 0.0]}
+    if count < 64:
+        return edited, "肤色取样不足，跳过颜色校正。", info
+    values = differences[selected]
+    shift = torch.quantile(values, 0.5, dim=0)
+    deviation = torch.quantile((values-shift).abs(), 0.5, dim=0)
+    if float(deviation.max()) > 0.025:
+        return edited, "取样色差不一致，跳过颜色校正。", info
+    # Offset only: retain contrast and linework; large changes are not treated as a color cast.
+    offset = shift.clamp(-0.04, 0.04) * strength
+    x0, y0, x1, y1 = local_box
+    result = edited.clone()
+    result[:, y0:y1, x0:x1, :3] = (edited[:, y0:y1, x0:x1, :3].float()+offset).clamp(0, 1).to(edited.dtype)
+    info.update(applied=True, offset_rgb=offset.detach().cpu().tolist())
+    maximum = float(offset.abs().max()) * 255
+    return result, f"{location}取样 {count} 点，轻量校正最大 {maximum:.2f}/255。", info
+
+
+def _micro_feather(alpha, pixels):
+    if pixels == 0:
+        return alpha
+    support = (alpha[..., 0] > 0).float()[:, None]
+    current = support
+    ramp = support.clone()
+    for _ in range(pixels):
+        current = 1-F.max_pool2d(F.pad(1-current, (1, 1, 1, 1), value=1), 3, stride=1)
+        ramp += current
+    # One pixel gives a half-weight boundary, with full strength immediately inside.
+    return alpha * (ramp[:, 0, :, :, None] / (pixels+1)).to(alpha)
+
+
 def _image_size(image):
     if image.ndim != 4 or image.shape[-1] not in (3, 4):
         raise ValueError("图像必须是 [batch, height, width, 3/4] 的 IMAGE。")
@@ -307,15 +371,20 @@ class QwenRegionComposite:
             "offset_x": ("FLOAT", {"default": 0.0, "min": -2048, "max": 2048, "step": 0.01, "round": 0.01, "tooltip": "把生成内容向右移动多少原图像素；负值向左。自动模式下为额外微调。"}),
             "offset_y": ("FLOAT", {"default": 0.0, "min": -2048, "max": 2048, "step": 0.01, "round": 0.01, "tooltip": "把生成内容向下移动多少原图像素；负值向上。"}),
             "scale": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.001, "round": 0.001, "tooltip": "围绕裁剪中心缩放生成内容。先自动对齐，再应用这里的缩放和位移。"}),
+            "color_mode": (["关闭", "轻量肤色"], {"default": "关闭", "tooltip": "自动过滤明显深色、高饱和图案，用对应肤色估计少量 RGB 色偏。取样不足或不一致时跳过；不改变结构和对比度。"}),
+            "color_strength": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "轻量颜色校正强度，建议从 0.3 起步。0 为关闭；图案颜色也会有少量变化。"}),
+            "edge_feather_pixels": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "只向实际编辑蒙版内过渡，不扩大选区。建议 1 像素；0 完全关闭。不会模糊整个生成图或纹身线条。"}),
+            "color_sample_mask": ("MASK", {"tooltip": "可选颜色取样蒙版，必须与原图同尺寸；白色区域用于估计色偏，不改变最终回贴范围。"}),
         }}
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("局部编辑完成图",)
     FUNCTION = "composite"
     CATEGORY = "Qwen/区域编辑"
-    DESCRIPTION = "对生成裁剪做自动或手动位置校正，再只在选框内回贴；框外逐像素保留原图。自动配准无法还原模型重画的五官或非刚性形变。"
+    DESCRIPTION = "先对齐，可选轻量肤色校正与 1 像素向内微羽化，再按实际蒙版回贴。框外逐像素保留；颜色取样不可靠时跳过，旧工作流默认关闭新功能。"
 
-    def composite(self, original, edited_crop, region, alignment="关闭", offset_x=0.0, offset_y=0.0, scale=1.0):
+    def composite(self, original, edited_crop, region, alignment="关闭", offset_x=0.0, offset_y=0.0, scale=1.0,
+                  color_mode="关闭", color_strength=0.3, edge_feather_pixels=0, color_sample_mask=None):
         w, h = _image_size(original)
         _image_size(edited_crop)
         if region.get("version") != 1 or tuple(region.get("source_size", ())) != (w, h):
@@ -331,6 +400,12 @@ class QwenRegionComposite:
             raise ValueError("未知的对齐模式。")
         if not all(math.isfinite(float(v)) for v in (offset_x, offset_y, scale)) or not (0.5 <= scale <= 2):
             raise ValueError("补偿位移必须为有限值，缩放需在 0.5–2.0 之间。")
+        if color_mode not in ("关闭", "轻量肤色"):
+            raise ValueError("未知的颜色校正模式。")
+        if not math.isfinite(float(color_strength)) or not 0 <= color_strength <= 1:
+            raise ValueError("颜色校正强度需要为 0–1 的有限数值。")
+        if not isinstance(edge_feather_pixels, int) or edge_feather_pixels < 0:
+            raise ValueError("微羽化像素需要为非负整数。")
         # Match Qwen's resized crop back to the original crop, never scale the full image.
         edit = edited_crop[:, :, :, :3].to(device=original.device, dtype=original.dtype)
         if tuple(edit.shape[1:3]) != (cy1-cy0, cx1-cx0):
@@ -350,9 +425,31 @@ class QwenRegionComposite:
             matrix = adjustment @ matrix
             if alignment == "手动" or offset_x != 0 or offset_y != 0 or scale != 1:
                 status += f" 手动补偿：x {offset_x:+.2f}px、y {offset_y:+.2f}px、缩放 {scale:.4f}。"
-        patch, valid = _aligned_patch(edit, local, matrix)
+        color_info = None
+        if color_mode != "关闭" and color_strength > 0:
+            sample = None
+            if color_sample_mask is not None:
+                if not torch.is_tensor(color_sample_mask) or tuple(color_sample_mask.shape) != (1, h, w):
+                    raise ValueError("颜色取样蒙版必须是与原图同尺寸的单张 MASK。")
+                if not bool(torch.isfinite(color_sample_mask).all()):
+                    raise ValueError("颜色取样蒙版含非有限值。")
+                sample = color_sample_mask[:, cy0:cy1, cx0:cx1].to(original)
+            aligned, coverage = _aligned_patch(edit, (0, 0, cx1-cx0, cy1-cy0), matrix)
+            support = mask[:, cy0:cy1, cx0:cx1].to(original.device) > 0
+            aligned, color_status, color_info = _correct_skin_color(
+                original[:, cy0:cy1, cx0:cx1, :3], aligned, support, coverage, local,
+                color_strength, sample)
+            lx0, ly0, lx1, ly1 = local
+            patch = aligned[:, ly0:ly1, lx0:lx1]
+            valid = coverage[:, ly0:ly1, lx0:lx1]
+            status += " " + color_status
+        else:
+            patch, valid = _aligned_patch(edit, local, matrix)
         alpha = mask[:, y0:y1, x0:x1].to(original).unsqueeze(-1)
         alpha = alpha * valid
+        alpha = _micro_feather(alpha, edge_feather_pixels)
+        if edge_feather_pixels:
+            status += f" 向内微羽化 {edge_feather_pixels}px。"
         uncovered = int(torch.count_nonzero(valid == 0))
         if uncovered:
             status += f" {uncovered} 个越界像素保留原图。"
@@ -360,7 +457,10 @@ class QwenRegionComposite:
         source = original[:, y0:y1, x0:x1, :3]
         # Difference form makes identity edits bit-exact, including feathered edges.
         result[:, y0:y1, x0:x1, :3] = torch.where(alpha > 0, source + (patch-source) * alpha, source)
-        if alignment == "关闭":
+        if alignment == "关闭" and color_mode == "关闭" and edge_feather_pixels == 0:
             return (result,)  # Preserve the existing three-input Python/API contract.
         logging.info("[Qwen Region] %s", status)
-        return {"ui": {"qwen_alignment_info": [status]}, "result": (result,)}
+        ui = {"qwen_alignment_info": [status]}
+        if color_info is not None:
+            ui["qwen_color_info"] = [color_info]
+        return {"ui": ui, "result": (result,)}
